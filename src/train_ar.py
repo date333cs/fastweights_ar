@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-from dataclasses import asdict
 from pathlib import Path
 import random
 from typing import Tuple
@@ -13,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from src.data_ar import VOCAB_SIZE, batch_encoded
-from src.models import IRNN
+from src.models import IRNN, LSTMClassifier
 
 
 def set_seed(seed: int) -> None:
@@ -43,8 +41,26 @@ def evaluate(model: torch.nn.Module, K: int, batch_size: int, n_batches: int, se
     return correct / total
 
 
+def build_model(name: str, R: int, emb: int, device: torch.device) -> torch.nn.Module:
+    name = name.lower()
+    if name == "irnn":
+        return IRNN(vocab_size=VOCAB_SIZE, emb_dim=emb, hidden_dim=R).to(device)
+    if name == "lstm":
+        return LSTMClassifier(vocab_size=VOCAB_SIZE, emb_dim=emb, hidden_dim=R).to(device)
+    raise ValueError(f"Unknown model: {name!r} (use irnn|lstm)")
+
+def maybe_freeze_embedding(model: torch.nn.Module, freeze: bool) -> None:
+    if not freeze:
+        return
+    if not hasattr(model, "emb"):
+        raise ValueError("Model has no attribute 'emb' to freeze.")
+    # Freeze embedding weights (keep the initial representation fixed)
+    model.emb.weight.requires_grad_(False)
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
+    p.add_argument("--model", type=str, default="irnn", choices=["irnn", "lstm"])
     p.add_argument("--R", type=int, default=50, help="hidden size")
     p.add_argument("--emb", type=int, default=100, help="embedding dim")
     p.add_argument("--K", type=int, default=8, help="number of key-value pairs")
@@ -56,6 +72,8 @@ def main() -> None:
     p.add_argument("--eval_batches", type=int, default=50)
     p.add_argument("--out", type=str, default="runs/tmp")
     p.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+    p.add_argument("--freeze_emb", action="store_true",
+                   help="Freeze token embedding (keep 37->emb_dim representation fixed).")
     args = p.parse_args()
 
     outdir = Path(args.out)
@@ -64,10 +82,10 @@ def main() -> None:
     device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
     set_seed(args.seed)
 
-    model = IRNN(vocab_size=VOCAB_SIZE, emb_dim=args.emb, hidden_dim=args.R).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    model = build_model(args.model, R=args.R, emb=args.emb, device=device)
+    maybe_freeze_embedding(model, args.freeze_emb)
+    opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
 
-    # Save config
     (outdir / "config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
 
     log_path = outdir / "log.csv"
@@ -89,9 +107,9 @@ def main() -> None:
                            seed0=args.seed, device=device)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{step},{loss.item():.6f},{acc:.6f}\n")
-            print(f"[step {step:6d}] loss={loss.item():.6f} acc={acc:.4f}")
-
-    # Save final model
+            frz = " freeze_emb" if args.freeze_emb else ""
+            print(f"[{args.model:4s}{frz} step {step:6d}] loss={loss.item():.6f} acc={acc:.4f}")
+ 
     torch.save(model.state_dict(), outdir / "model.pt")
     print(f"Saved to: {outdir}")
 
