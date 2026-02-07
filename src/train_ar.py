@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 from src.data_ar import VOCAB_SIZE, batch_encoded
 from src.datasets_ar import load_npz_dataset
-from src.models import IRNN, LSTMClassifier
+from src.models import IRNN, LSTMClassifier, FastWeightsClassifier
 
 
 def set_seed(seed: int) -> None:
@@ -22,13 +22,19 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def build_model(name: str, R: int, emb: int, device: torch.device) -> torch.nn.Module:
+def build_model(name: str, R: int, emb: int, device: torch.device,
+                fw_eta: float, fw_lam: float, fw_S: int) -> torch.nn.Module:
     name = name.lower()
     if name == "irnn":
         return IRNN(vocab_size=VOCAB_SIZE, emb_dim=emb, hidden_dim=R).to(device)
     if name == "lstm":
         return LSTMClassifier(vocab_size=VOCAB_SIZE, emb_dim=emb, hidden_dim=R).to(device)
-    raise ValueError(f"Unknown model: {name!r} (use irnn|lstm)")
+    if name == "fw":
+        return FastWeightsClassifier(
+            vocab_size=VOCAB_SIZE, emb_dim=emb, hidden_dim=R,
+            fw_eta=fw_eta, fw_lam=fw_lam, inner_steps=fw_S,
+        ).to(device)
+    raise ValueError(f"Unknown model: {name!r} (use irnn|lstm|fw)")
 
 
 def maybe_freeze_embedding(model: torch.nn.Module, freeze: bool) -> None:
@@ -85,7 +91,10 @@ def evaluate_online(model: torch.nn.Module, K: int, batch_size: int, n_batches: 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--model", type=str, default="irnn", choices=["irnn", "lstm"])
+    p.add_argument("--model", type=str, default="irnn", choices=["irnn", "lstm", "fw"])
+    p.add_argument("--fw_eta", type=float, default=0.5)
+    p.add_argument("--fw_lam", type=float, default=0.9)
+    p.add_argument("--fw_S", type=int, default=1)
     p.add_argument("--R", type=int, default=50, help="hidden size")
     p.add_argument("--emb", type=int, default=100, help="embedding dim")
 
@@ -118,7 +127,8 @@ def main() -> None:
     device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
     set_seed(args.seed)
 
-    model = build_model(args.model, R=args.R, emb=args.emb, device=device)
+    model = build_model(args.model, R=args.R, emb=args.emb, device=device,fw_eta=args.fw_eta, fw_lam=args.fw_lam, fw_S=args.fw_S)
+
     maybe_freeze_embedding(model, args.freeze_emb)
 
     opt = torch.optim.Adam((pp for pp in model.parameters() if pp.requires_grad), lr=args.lr)
