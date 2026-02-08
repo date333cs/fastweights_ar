@@ -32,7 +32,7 @@ def build_model(name: str, R: int, emb: int, device: torch.device,
     if name == "fw":
         return FastWeightsClassifier(
             vocab_size=VOCAB_SIZE, emb_dim=emb, hidden_dim=R,
-            fw_eta=fw_eta, fw_lam=fw_lam, inner_steps=fw_S,
+            fw_eta=fw_eta, fw_lam=fw_lam, fw_S=fw_S,
         ).to(device)
     raise ValueError(f"Unknown model: {name!r} (use irnn|lstm|fw)")
 

@@ -1,6 +1,7 @@
 # src/models.py
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -96,16 +97,18 @@ class LSTMClassifier(nn.Module):
         h_last = h_n[-1]     # (B, hidden_dim)
         return self.readout(h_last)
 
+
 class FastWeightsClassifier(nn.Module):
     """
-    Fast Weights RNN for associative retrieval.
-    - token -> embedding (emb_dim)
-    - recurrent core with hidden_dim = R (ReLU)
-      * slow weights: W (R x R), C (R x emb_dim)
-      * fast weights: A(t) (R x R), updated by A <- lam*A + eta*h*h^T
-      * inner-loop settling: run S steps per time step
-      * layer norm applied to summed input before ReLU
-    - head: 100 ReLU -> logits(10)
+    Fast weights RNN (Ba et al., 2016) for associative retrieval.
+    - Input: token ids (B,T)
+    - Embedding -> recurrent core with fast matrix A(t)
+    - Readout: final h -> (100 ReLU) -> 10 classes
+
+    Key implementation points:
+      (1) h0 = ReLU(u)  where u = W h + U x  (NO LayerNorm here)
+      (2) inner loop: hs = ReLU( LayerNorm( u + A @ hs ) ) repeated S times
+      (3) A update: A = lam * A + eta * (h outer h)   (do NOT detach by default)
     """
     def __init__(
         self,
@@ -116,53 +119,67 @@ class FastWeightsClassifier(nn.Module):
         head_dim: int = 100,
         fw_eta: float = 0.5,
         fw_lam: float = 0.9,
-        inner_steps: int = 1,
-        w_scale: float = 0.05,
-    ) -> None:
+        fw_S: int = 1,
+    ):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, emb_dim)
 
-        self.hidden_dim = hidden_dim
-        self.fw_eta = float(fw_eta)
-        self.fw_lam = float(fw_lam)
-        self.inner_steps = int(inner_steps)
-
         # slow weights
-        self.W = nn.Parameter(torch.empty(hidden_dim, hidden_dim))
-        self.C = nn.Linear(emb_dim, hidden_dim, bias=False)
-        self.b = nn.Parameter(torch.zeros(hidden_dim))
+        self.U = nn.Linear(emb_dim, hidden_dim, bias=False)
+        self.W = nn.Linear(hidden_dim, hidden_dim, bias=False)
 
-        # layer norm (applied to hidden_dim vector)
+        # init: W = 0.05 * I (paper)
+        with torch.no_grad():
+            self.W.weight.zero_()
+            self.W.weight += 0.05 * torch.eye(hidden_dim)
+
+        # init: U uniform(-1/sqrt(H), +1/sqrt(H)) where H = fan_out (paper)
+        # For Linear(emb_dim -> hidden_dim), fan_out = hidden_dim.
+        bound = 1.0 / math.sqrt(hidden_dim)
+        with torch.no_grad():
+            self.U.weight.uniform_(-bound, bound)
+
         self.ln = nn.LayerNorm(hidden_dim)
+        self.relu = nn.ReLU()
 
-        # head (shared style with other models)
+        self.fw_eta = fw_eta
+        self.fw_lam = fw_lam
+        self.fw_S = fw_S
+
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, head_dim),
             nn.ReLU(),
             nn.Linear(head_dim, num_classes),
         )
 
-        self.reset_parameters(w_scale=w_scale)
-
-    def reset_parameters(self, w_scale: float = 0.05) -> None:
-        # W := w_scale * I
-        with torch.no_grad():
-            self.W.zero_()
-            self.W += w_scale * torch.eye(self.hidden_dim)
-
-        # C (input-to-hidden) like standard linear init
-        nn.init.kaiming_uniform_(self.C.weight, a=5 ** 0.5)
-
-        # embedding
-        nn.init.normal_(self.emb.weight, mean=0.0, std=0.02)
-
-        # bias already zeros
-
     def forward(self, x_ids: torch.Tensor) -> torch.Tensor:
-        """
-        x_ids: (B, T) int64
-        returns logits: (B, 10)
-        """
+        B, T = x_ids.shape
+        x = self.emb(x_ids)  # (B,T,emb_dim)
+
+        h = torch.zeros(B, self.W.in_features, device=x_ids.device, dtype=x.dtype)
+        A = torch.zeros(B, self.W.in_features, self.W.in_features, device=x_ids.device, dtype=x.dtype)
+
+        for t in range(T):
+            # sustained boundary condition (u = W h + U x_t)
+            u = self.W(h) + self.U(x[:, t, :])  # (B,R)
+
+            # preliminary state (NO LayerNorm here)
+            hs = self.relu(u)
+
+            # inner loop: apply LayerNorm each iteration
+            for _ in range(self.fw_S):
+                Ah = torch.bmm(A, hs.unsqueeze(2)).squeeze(2)  # (B,R)
+                hs = self.relu(self.ln(u + Ah))
+
+            h = hs
+
+            # fast weight update (once per time step)
+            # IMPORTANT: do NOT detach by default
+            outer = torch.bmm(h.unsqueeze(2), h.unsqueeze(1))  # (B,R,R)
+            A = self.fw_lam * A + self.fw_eta * outer
+
+        return self.head(h)
+
         B, T = x_ids.shape
         device = x_ids.device
         R = self.hidden_dim
