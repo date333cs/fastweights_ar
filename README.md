@@ -192,5 +192,5 @@ Typical starting point (as used in this repo):
 
 ## License
 
-MIT (or choose a license and update this section).
+MIT
 
